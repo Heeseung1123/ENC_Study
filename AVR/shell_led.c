@@ -1,3 +1,5 @@
+//simple shell with LED on/off feature 
+
 #include <avr/io.h>
 
 #define F_CPU 16000000UL
