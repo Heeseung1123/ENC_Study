@@ -98,9 +98,20 @@ uint8_t SPI_MasterTransmit(uint8_t cData)
 
 void ENC_WriteReg(uint8_t address, uint8_t data) {
 	PORT_SPI &= ~(1 << DD_CS);
-	SPI_MasterTransmit(0x40 | address); //write Opcode 010
+	SPI_MasterTransmit(0x40 | address); //write Opcode 010, rest 5 bit is 
+					    //for control register address 
 	SPI_MasterTransmit(data); //8 bit data 
 	PORT_SPI |= (1 << DD_CS);
+}
+
+uint8_t ENC_ReadReg(uint8_t address) {	
+	volatile static uint8_t tmp;
+	PORT_SPI &= ~(1 << DD_CS);
+	SPI_MasterTransmit(0x00 | address); //setting address to read 
+	SPI_MasterTransmit(0x00);         // first Dummy 
+	tmp = SPI_MasterTransmit(0x00); //actual read data		
+	PORT_SPI |= (1 << DD_CS);
+	return tmp;
 }
 
 
@@ -112,6 +123,52 @@ void ENC_WritePhy(uint8_t address, uint16_t data) {
 	_delay_us(200);                   // PHY 처리 대기
 }
 
+void ENC_ReadPhy(uint8_t address, uint16_t* data) {
+	ENC_WriteReg(0x1f, 0x02);
+	ENC_WriteReg(0x14, address);
+	ENC_WriteReg(0x12, 0x01);	//set bit to MICMD.MIIRD
+	ENC_WriteReg(0x1f, 0x03);	//change to bank 3 for MISTAT 
+
+	while(ENC_ReadReg(0x0a) & 0x01a);	//polling MISTAT.BUSY
+	
+
+	ENC_WriteReg(0x1f, 0x02);	//change to bank 2 for MICMD,MIRD
+	ENC_WriteReg(0x12, 0x00);	//clear MICMD.MIIRD
+					//
+	uint8_t low_byte = ENC_ReadReg(0x18);
+	uint8_t	high_byte = ENC_ReadReg(0x19);
+	*data	= ((uint16_t)high_byte << 8) | low_byte;
+}
+
+
+void UART_Transmit_Hex(uint8_t n) {
+    uint8_t nibble;
+
+    UART_Transmit('0');
+    UART_Transmit('x');
+
+    // 상위 4비트
+    nibble = (n >> 4) & 0x0F;
+    UART_Transmit(nibble < 10 ? nibble + '0' : nibble - 10 + 'A');
+
+    // 하위 4비트
+    nibble = n & 0x0F;
+    UART_Transmit(nibble < 10 ? nibble + '0' : nibble - 10 + 'A');
+}
+
+void Display_Revision(void) {
+    uint8_t rev;
+
+    ENC_WriteReg(0x1F, 0x03); 
+
+    // 2. EREVID(0x12) 레지스터 읽기
+    // 0x12는 ETH 레지스터이므로 Dummy 없이 2번의 SPI 전송으로 끝남
+    rev = ENC_ReadReg(0x12);
+
+    // 3. 읽어온 값을 UART로 출력 (예: "Rev: 06")
+    UART_Transmit_Hex(rev); // HEX 형태로 출력하는 함수가 있다고 가정
+    UART_Transmit('\n');
+}
 
 #include <avr/interrupt.h>
 
@@ -170,6 +227,9 @@ int main(void) {
 		                }
 			
 		            }
+			else if(my_strcmp(buf, "REV") == 0) {
+				Display_Revision();
+			}
 			    command_ready = 0;
 		    } //command ready end 
 
