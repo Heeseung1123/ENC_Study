@@ -3,7 +3,7 @@
  * @brief Sync Blinking between On-board LED and ENC28J60 PHY LED
  * @details 
  * - Timer0: 10ms CTC mode for 0.5s toggle interval.
- * - UART0: Interrupt-based shell for "LED" command.
+ * - uart0: Interrupt-based shell for "LED" command.
  * - SPI: Hardware SPI for ENC28J60 PHY register access.
  */
 
@@ -52,7 +52,7 @@ int my_strcmp(const unsigned char* s1, const char* s2) {
 
 
 
-__attribute__ ((signal)) void USART0_RX_vect(void)  { //ISR for UART RX int
+__attribute__ ((signal)) void USART0_RX_vect(void)  { //ISR for uart RX int
 	tmp = UDR0; 	
 
         if (tmp == '\r' || tmp == '\n') { // 엔터 입력 시
@@ -141,19 +141,19 @@ void ENC_ReadPhy(uint8_t address, uint16_t* data) {
 }
 
 
-void UART_Transmit_Hex(uint8_t n) {
+void uart_transmit_Hex(uint8_t n) {
     uint8_t nibble;
 
-    UART_Transmit('0');
-    UART_Transmit('x');
+    uart_transmit('0');
+    uart_transmit('x');
 
     // 상위 4비트
     nibble = (n >> 4) & 0x0F;
-    UART_Transmit(nibble < 10 ? nibble + '0' : nibble - 10 + 'A');
+    uart_transmit(nibble < 10 ? nibble + '0' : nibble - 10 + 'A');
 
     // 하위 4비트
     nibble = n & 0x0F;
-    UART_Transmit(nibble < 10 ? nibble + '0' : nibble - 10 + 'A');
+    uart_transmit(nibble < 10 ? nibble + '0' : nibble - 10 + 'A');
 }
 
 void Display_Revision(void) {
@@ -165,9 +165,9 @@ void Display_Revision(void) {
     // 0x12는 ETH 레지스터이므로 Dummy 없이 2번의 SPI 전송으로 끝남
     rev = ENC_ReadReg(0x12);
 
-    // 3. 읽어온 값을 UART로 출력 (예: "Rev: 06")
-    UART_Transmit_Hex(rev); // HEX 형태로 출력하는 함수가 있다고 가정
-    UART_Transmit('\n');
+    // 3. 읽어온 값을 uart로 출력 (예: "Rev: 06")
+    uart_transmit_Hex(rev); // HEX 형태로 출력하는 함수가 있다고 가정
+    uart_transmit('\n');
 }
 
 #include <avr/interrupt.h>
