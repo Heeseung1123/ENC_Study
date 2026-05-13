@@ -1,0 +1,51 @@
+/dts-v1/;
+/plugin/;
+
+/{
+    compatible = "ti,beaglebone", "ti,beaglebone-black";
+    part-number = "ENC28J60-SPI0";
+    version = "00A0";
+
+    /* Free up the pins used by the cape from the pinmux helpers */
+    exclusive-use = 
+        "P9.22", /* SPI0_SCLK */
+        "P9.21", /* SPI0_D0 */
+        "P9.18", /* SPI0_D1 */
+        "P9.17", /* SPI0_CS0 */
+        "spi0";
+
+    fragment@0 {
+        target = <&am33xx_pinmux>;
+        __overlay__ {
+            enc28j60_pins: pinmux_enc28j60_pins {
+                pinctrl-single,pins = <
+                    0x150 0x30 /* P9_22 - spi0_sclk.spi0_sclk, MODE0 | PULLUP */
+                    0x154 0x30 /* P9_21 - spi0_d0.spi0_d0, MODE0 | PULLUP */
+                    0x158 0x10 /* P9_18 - spi0_d1.spi0_d1, MODE0 | PULLUP */
+                    0x15c 0x10 /* P9_17 - spi0_cs0.spi0_cs0, MODE0 | PULLUP */
+                >;
+            };
+        };
+    };
+
+    fragment@1 {
+        target = <&spi0>;
+        __overlay__ {
+            #address-cells = <1>;
+            #size-cells = <0>;
+            status = "okay";
+            pinctrl-names = "default";
+            pinctrl-0 = <&enc28j60_pins>;
+
+            ethernet@0 {
+                compatible = "microchip,enc28j60";
+                reg = <0>; /* CS0 */
+                spi-max-frequency = <12000000>;
+                interrupt-parent = <&gpio1>;
+                interrupts = <28>; /* P9_12 - GPIO1[28]
+                /* Optional: reset-gpios = <&gpio1 17 0>; */
+            };
+        };
+    };
+};
+
