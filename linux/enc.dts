@@ -12,6 +12,7 @@
         "P9.21", /* SPI0_D0 */
         "P9.18", /* SPI0_D1 */
         "P9.17", /* SPI0_CS0 */
+	"P9.12",
         "spi0";
 
     fragment@0 {
@@ -23,9 +24,10 @@
                     0x154 0x30 /* P9_21 - spi0_d0.spi0_d0, MODE0 | PULLUP */
                     0x158 0x10 /* P9_18 - spi0_d1.spi0_d1, MODE0 | PULLUP */
                     0x15c 0x10 /* P9_17 - spi0_cs0.spi0_cs0, MODE0 | PULLUP */
+                    0x078 0x37  /* P9_12 GPIO1[28] input pullup */
                 >;
             };
-        };
+        };    
     };
 
     fragment@1 {
@@ -36,17 +38,19 @@
             status = "okay";
             pinctrl-names = "default";
             pinctrl-0 = <&enc28j60_pins>;
-
-	    spidev@0 {
-		    status = "disabled";
-	    };
+	    
+	    channel@0 { status = "disabled"; };
+	    channel@1 { status = "disabled"; };	
 
             ethernet@0 {
-                compatible = "my,enc28j60";
+                compatible = "my,enc28j60_custom";
                 reg = <0>; /* CS0 */
                 spi-max-frequency = <12000000>;
+//	        pinctrl-names = "default";
+//              pinctrl-0 = <&enc28j60_irq_pins>;  /* IRQ 핀 별도 */
                 interrupt-parent = <&gpio1>;
-                interrupts = <28>; /* P9_12 - GPIO1[28]
+                interrupts = <28 2>; // P9_12 - GPIO1[28]
+		status = "okay";
                 /* Optional: reset-gpios = <&gpio1 17 0>; */
             };
         };

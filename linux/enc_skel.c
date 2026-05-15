@@ -139,16 +139,19 @@ static void test_enc28j60_sram(struct spi_device *spi)
 		printk(KERN_ERR "ENC28J60: SRAM R/W test failed! Data mismatch detected.\n");
 }
 
+static irqreturn_t enc28j60_irq_thread(int irq, void *dev_id) 
+{
+	return IRQ_HANDLED;
+}
+
 /**
  * my_enc28j60_probe - Bind the driver to an SPI device
  */
-
-
-
 static int my_enc28j60_probe(struct spi_device *spi)
 {
 	my_spi = spi; 
 	u8 rev; 
+	int ret; 
 
 	printk(KERN_INFO "======================================\n");
 	printk(KERN_INFO "My Driver: Probe function called!\n");
@@ -156,11 +159,15 @@ static int my_enc28j60_probe(struct spi_device *spi)
 	printk(KERN_INFO "======================================\n");
 
 	test_enc28j60_sram(my_spi);
-
-	rev = get_revision();
+	rev = get_revision();	
 	printk(KERN_INFO "Revision Number: %x\n", rev);
+	
 
-	return 0;
+	    printk(KERN_INFO "probe called, spi->irq = %d\n", spi->irq);
+	ret = request_threaded_irq(spi->irq, NULL, enc28j60_irq_thread, 
+		IRQF_ONESHOT, "my_enc28j60", spi);
+
+	return ret; 
 }
 
 /**
@@ -174,7 +181,7 @@ static int my_enc28j60_remove(struct spi_device *spi)
 
 /* Device Tree matching table */
 static const struct of_device_id my_enc28j60_dt_ids[] = {
-	{ .compatible = "my,enc28j60", },
+	{ .compatible = "my,enc28j60_custom", },
 	{ /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, my_enc28j60_dt_ids);
