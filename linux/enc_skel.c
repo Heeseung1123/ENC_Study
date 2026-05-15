@@ -65,7 +65,7 @@ static int spi_read_buf(struct spi_device *spi,
 {
 	int ret = 0; 
 	u8 tx_buf[1]; 
-	tx_buf[0] = (0x7A);
+	tx_buf[0] = 0x3a;
 
 	spi_writeReg(spi, 0x1f, 0x00);
 
@@ -92,8 +92,8 @@ static int spi_write_buf(struct spi_device *spi,
 	spi_writeReg(spi, 0x03, (addr >> 8)); 
 
 	spi_transfer_buf[0]  = 0x7A;
-	memcpy(&spi_transfer_buf[1], spi_transfer_buf, len);
-	ret = spi_write(spi, tx_buf, len+1);
+	memcpy(&spi_transfer_buf[1], tx_buf, len);
+	ret = spi_write(spi, spi_transfer_buf, len+1);
 
 	if(ret) {
 		printk(KERN_INFO "spi_write_buf failed\n");
@@ -155,10 +155,11 @@ static int my_enc28j60_probe(struct spi_device *spi)
 	printk(KERN_INFO "My Driver: Matching with compatible 'my,enc28j60' SUCCESS!\n");
 	printk(KERN_INFO "======================================\n");
 
+	test_enc28j60_sram(my_spi);
+
 	rev = get_revision();
 	printk(KERN_INFO "Revision Number: %x\n", rev);
 
-	test_enc28j60_sram(my_spi);
 	return 0;
 }
 
