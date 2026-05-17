@@ -5,6 +5,7 @@
 #include <linux/of.h>
 #include <linux/types.h>
 #include <linux/delay.h>
+#include <linux/etherdevice.h>
 
 static struct spi_device *my_spi;
 static u8 rx_test_buf[1518];
@@ -114,27 +115,27 @@ static int spi_write_buf(struct spi_device *spi,
 }
 
 
-/**
- * test_enc28j60_sram - Test the ENC28J60 internal SRAM read/write operations.
- * @spi: Pointer to the SPI device structure.
- */
+/*
+  test_enc28j60_sram - Test the ENC28J60 internal SRAM read/write operations.
+  @spi: Pointer to the SPI device structure.
+
 static void test_enc28j60_sram(struct spi_device *spi)
 {
 	u8 test_data_out[10] = {0xDE, 0xAD, 0xBE, 0xEF, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC};
 	u8 test_data_in[10] = {0};
-	u16 test_addr = 0x1000; /* Arbitrary address within SRAM (0x0000-0x1FFF) */
+	u16 test_addr = 0x1000; // Arbitrary address within SRAM (0x0000-0x1FFF) 
 	int i;
 	bool success = true;
 
 	printk(KERN_INFO "ENC28J60: Starting SRAM test at address 0x%04x\n", test_addr);
 
-	/* Step 1: Write test pattern to SRAM */
+	// Step 1: Write test pattern to SRAM 
 	spi_write_buf(spi, test_addr, 10, test_data_out);
 
-	/* Step 2: Read back the data from SRAM */
+	// Step 2: Read back the data from SRAM 
 	spi_read_buf(spi, test_addr, 10, test_data_in);
 
-	/* Step 3: Compare and verify the data */
+	///Step 3: Compare and verify the data 
 	printk(KERN_INFO "ENC28J60: Data read back: ");
 	for (i = 0; i < 10; i++) {
 		printk(KERN_CONT "%02x ", test_data_in[i]);
@@ -147,7 +148,23 @@ static void test_enc28j60_sram(struct spi_device *spi)
 		printk(KERN_INFO "ENC28J60: SRAM R/W test passed\n");
 	else
 		printk(KERN_ERR "ENC28J60: SRAM R/W test failed! Data mismatch detected.\n");
+} */ 
+
+static u8 enc28j60_mac_addr(struct spi_device *spi) {
+	u8 mac_addr[6];
+	eth_random_addr(mac_addr);
+	printk(KERN_INFO "my_enc28j60: Generated Random MAC = %pM\n", mac_addr);
+	enc28j60_set_bank(spi, 3);
+	spi_writeReg(spi, 0x00, mac_addr[0]); // MAADR5 
+	spi_writeReg(spi, 0x01, mac_addr[1]); // MAADR4
+	spi_writeReg(spi, 0x02, mac_addr[2]); // MAADR3
+	spi_writeReg(spi, 0x03, mac_addr[3]); // MAADR2
+	spi_writeReg(spi, 0x04, mac_addr[4]); // MAADR1
+	spi_writeReg(spi, 0x05, mac_addr[5]); // MAADR0 
+
+	enc28j60_set_bank(spi, 0);
 }
+
 
 static u16 erxrdpt_workaround(u16 next_packet_ptr)
 {
@@ -210,6 +227,7 @@ static int enc28j60_hw_init(struct spi_device *spi)
     u8 econ1 = spi_readReg(spi, 0x1f);
     spi_writeReg(spi, 0x1f, econ1 | 0x04);
 
+    enc28j60_mac_addr(spi);
     return 0;
 }
 
