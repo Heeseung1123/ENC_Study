@@ -6,13 +6,17 @@
 #include <linux/types.h>
 #include <linux/delay.h>
 #include <linux/etherdevice.h>
-
+#include <linux/skbuff.h>
+#include <linux/netdevice.h>
 struct enc_priv {
 	struct spi_device *my_spi;
 	struct net_device *netdev;
-	u8 rx_test_buf[1518];
 	u8 spi_transfer_buf[1518];
 	u16 next_ptr;
+
+	struct work_struct tx_work;
+	struct sk_buff *tx_skb; 
+//	struct mutex spi_lock;
 };
 
 static u8 spi_readReg(struct spi_device *spi, u8 address)
@@ -100,32 +104,6 @@ static int spi_read_buf(struct spi_device *spi,
 	return ret;
 
 }
-
-/*
- * spi_write_buf - write a data buffer to ENC28J60 SRAM via WBM command
- * @priv: driver private data; priv->spi_transfer_buf is used to prepend
- *        the WBM opcode (0x7A) before the payload
- * @len:  number of payload bytes to write
- * @tx_buf: pointer to the data to write
- *
- * The caller is responsible for setting EWRPT before calling this function.
- */
-static int spi_write_buf(struct enc_priv *priv, int len, u8 *tx_buf) 
-{
-	int ret = 0; 
-
-	priv->spi_transfer_buf[0]  = 0x7A;
-	memcpy(&priv->spi_transfer_buf[1], tx_buf, len);
-	ret = spi_write(priv->my_spi, priv->spi_transfer_buf, len+1);
-
-	if(ret) {
-		printk(KERN_INFO "spi_write_buf failed\n");
-	}
-
-	return ret; 
-
-}
-
 
 
 
@@ -224,48 +202,13 @@ static int enc28j60_hw_init(struct enc_priv *priv)
 	return 0;
 }
 
-/*
- * enc28j60_tx - transmit a single Ethernet frame
- * @priv: driver private data
- * @len:  frame length in bytes (excluding per-packet control byte)
- * @tx_buf: pointer to frame data
- *
- * TX buffer is fixed at 0x1A00 - 0x1FFF.
- * A per-packet control byte (0x00 = use MACON3 defaults) is written
- * before the frame.  ECON1.TXRTS is set to start transmission.
- */
-static int enc28j60_tx(struct enc_priv *priv, int len, u8 *tx_buf) 
-{
-	struct spi_device *spi = priv->my_spi;
-	u8 bfs[2];
-	u16 etxnd; 
-	u8 control[2];
-	control[0] = 0x7a;
-	control[1] = 0x00;
-
-	enc28j60_set_bank(spi, 0);	
-	spi_writeReg(spi, 0x02, 0x00);	//EWRPTL
-	spi_writeReg(spi, 0x03, 0x1A);	//EWRPTH
-						
-	etxnd = 0x1A00 + len; 
-	spi_writeReg(spi, 0x06, etxnd & 0xFF);	//ETXNDL
-	spi_writeReg(spi, 0x07, etxnd >> 8);	//ETXNDH 
-	
-	spi_write(spi, control, 2); //write per-packet control byte 
-	spi_write_buf(priv, len, tx_buf);	//SRAM data write 
-						//
-	//set ECON1.TXRTS, transmit request to send bit from ETXST to ETXND 
-	bfs[0] = 0x80 | 0x1F;		
-	bfs[1] = 0x08;
-	spi_write(spi, bfs, 2);
-
-	return 0;
-}
 
 
 static int enc28j60_rx(struct enc_priv *priv) 
 {
 	struct spi_device *spi = priv->my_spi;
+	struct sk_buff *skb = NULL;
+	struct net_device *dev = priv->netdev;
 	u16 next_pk_ptr;
 	int i, ret, len; 
 	ret = 0;
@@ -286,10 +229,22 @@ static int enc28j60_rx(struct enc_priv *priv)
 	len <<= 8;
 	len |= rsv[2];	
 
-	if(spi_read_buf(spi, rx_packet_start(priv->next_ptr), len, priv->rx_test_buf)) {		
+	skb = netdev_alloc_skb(dev, len + NET_IP_ALIGN); 
+	if(!skb) {
+
+		dev->stats.rx_dropped++;		
+		return -1;
+	}
+
+	skb_reserve(skb, NET_IP_ALIGN);
+	if(spi_read_buf(spi, rx_packet_start(priv->next_ptr), len, skb_put(skb, len))) {		
+		dev_kfree_skb(skb);
 		printk(KERN_DEBUG "enc28j60_rx failed to read buf_2\n");
 		return -1;  
 	}
+
+	skb->protocol = eth_type_trans(skb, dev); 
+	netif_rx_ni(skb);
 
 	enc28j60_set_bank(spi, 0);
 
@@ -304,8 +259,6 @@ static int enc28j60_rx(struct enc_priv *priv)
 
 	priv->next_ptr = next_pk_ptr;
 
-	printk(KERN_INFO "ENC28J60: RX Interrupt Checking: ");
-	print_hex_dump(KERN_INFO, "ENC28J60: RX Packet: ", DUMP_PREFIX_OFFSET, 16, 1, priv->rx_test_buf, len, true);
 	return ret; 
 }
 
@@ -388,6 +341,70 @@ static irqreturn_t enc28j60_irq_thread(int irq, void *dev_id)
 }
 
 /*
+ * enc28j60_tx - transmit a single Ethernet frame
+ * @priv: driver private data
+ * @len:  frame length in bytes (excluding per-packet control byte)
+ * @tx_buf: pointer to frame data
+ *
+ * TX buffer is fixed at 0x1A00 - 0x1FFF.
+ * A per-packet control byte (0x00 = use MACON3 defaults) is written
+ * before the frame.  ECON1.TXRTS is set to start transmission.
+ */
+static void enc28j60_tx(struct enc_priv *priv, int len, u8 *tx_buf) 
+{
+	struct spi_device *spi = priv->my_spi;
+	u8 bfs[2];
+	u16 etxnd; 
+	u8 control[2];
+
+
+	printk(KERN_INFO "enc28j60_Tx!!!!!!!!!!!\n");
+	control[0] = 0x7a;
+	control[1] = 0x00;
+
+	enc28j60_set_bank(spi, 0);	
+	spi_writeReg(spi, 0x02, 0x00);	//EWRPTL
+	spi_writeReg(spi, 0x03, 0x1A);	//EWRPTH
+						
+	etxnd = 0x1A00 + len; 
+	spi_writeReg(spi, 0x06, etxnd & 0xFF);	//ETXNDL
+	spi_writeReg(spi, 0x07, etxnd >> 8);	//ETXNDH 
+	
+	priv->spi_transfer_buf[0] = 0x7A; /* WBM opcode */
+	priv->spi_transfer_buf[1] = 0x00; /* per-packet control byte */
+	memcpy(&priv->spi_transfer_buf[2], tx_buf, len);
+        spi_write(spi, priv->spi_transfer_buf, len + 2);
+
+	//set ECON1.TXRTS, transmit request to send bit from ETXST to ETXND 
+	bfs[0] = 0x80 | 0x1F;		
+	bfs[1] = 0x08;
+	spi_write(spi, bfs, 2);
+
+	while (spi_readReg(spi, 0x1F) & 0x08) {
+		cpu_relax();
+	}
+
+	printk(KERN_INFO "my_enc28j60: Hardware TX Done!\n");
+}
+
+static void enc28j60_tx_work(struct work_struct *work)
+{
+    struct enc_priv *priv = container_of(work, struct enc_priv, tx_work);
+    struct sk_buff *skb = priv->tx_skb;
+
+    enc28j60_tx(priv, skb->len, skb->data);
+
+    priv->netdev->stats.tx_packets++;
+    priv->netdev->stats.tx_bytes += skb->len;
+
+    dev_kfree_skb(skb);
+    priv->tx_skb = NULL;
+
+    /* re-enable queue after TX completes */
+    netif_wake_queue(priv->netdev);
+}
+
+/*
  * enc28j60_start_xmit - ndo_start_xmit handler for net_device_ops
  * @skb: socket buffer handed down from the network stack
  * @dev: net_device associated with this driver instance
@@ -399,17 +416,56 @@ static netdev_tx_t enc28j60_start_xmit(struct sk_buff *skb,
 					struct net_device *dev)
 {
 	struct enc_priv *priv = netdev_priv(dev);
+	priv->tx_skb = skb; 
 
-	enc28j60_tx(priv, skb->len, skb->data);
+	netif_stop_queue(dev);
+	schedule_work(&priv->tx_work);
 
-	dev->stats.tx_packets++;
-	dev->stats.tx_bytes += skb->len;
-
-	dev_kfree_skb(skb);
 	return NETDEV_TX_OK;
 }
 
+static int enc28j60_open(struct net_device *dev) 
+{
+	struct enc_priv *priv = netdev_priv(dev);
+	struct spi_device *spi = priv->my_spi;
+
+	printk(KERN_INFO "my_enc28j60: ndo_open called!!!...\n");
+	
+	msleep(50);
+	/* hw_init also calls enc28j60_set_mac_addr() as its last step */
+	enc28j60_hw_init(priv); 
+	msleep(20);
+
+	netif_start_queue(dev);
+	netif_wake_queue(dev);
+
+	return 0;
+}
+
+static int enc28j60_stop(struct net_device *dev) 
+{
+	struct enc_priv *priv = netdev_priv(dev);
+	struct spi_device *spi = priv->my_spi;
+	u8 econ1;
+
+	printk(KERN_INFO "my_enc28j60: ndo_stop called! Shutting down HW...\n");
+	netif_stop_queue(dev);
+	cancel_work_sync(&priv->tx_work);
+
+	// 마스터 인터럽트 스위치 OFF
+	enc28j60_set_bank(spi, 0);
+	spi_writeReg(spi, 0x1b, 0x00);
+
+	// RXEN 오프하여 수신 엔진 일시정지
+	econ1 = spi_readReg(spi, 0x1f);
+	spi_writeReg(spi, 0x1f, econ1 & ~0x04);
+
+	msleep(50);
+	return 0;
+}
 static const struct net_device_ops enc28j60_netdev_ops = {
+	.ndo_open	= enc28j60_open, 
+	.ndo_stop	= enc28j60_stop,
 	.ndo_start_xmit = enc28j60_start_xmit,
 };
 
@@ -454,8 +510,8 @@ static int my_enc28j60_probe(struct spi_device *spi)
 
 	printk(KERN_INFO "probe called, spi->irq = %d\n", spi->irq);
 
-	/* hw_init also calls enc28j60_set_mac_addr() as its last step */
-	enc28j60_hw_init(priv); 
+
+	INIT_WORK(&priv->tx_work, enc28j60_tx_work);
 
 	/* pass priv as dev_id so enc28j60_irq_thread() can reach all state */
 	ret = request_threaded_irq(spi->irq, NULL, enc28j60_irq_thread, 
@@ -478,6 +534,7 @@ static int my_enc28j60_remove(struct spi_device *spi)
 	unregister_netdev(priv->netdev);
 	free_irq(spi->irq, priv);	/* dev_id must match what probe passed */
 	free_netdev(priv->netdev);
+	cancel_work_sync(&priv->tx_work);
 	printk(KERN_INFO "My Driver: Remove function called. Goodbye!\n");
 	return 0;
 }
