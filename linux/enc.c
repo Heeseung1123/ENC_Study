@@ -7,10 +7,13 @@
 #include <linux/delay.h>
 #include <linux/etherdevice.h>
 
-static struct spi_device *my_spi;
-static u8 rx_test_buf[1518];
-static u8 spi_transfer_buf[1518];
-static u16 next_ptr;
+struct enc_priv {
+	struct spi_device *my_spi;
+	struct net_device *netdev;
+	u8 rx_test_buf[1518];
+	u8 spi_transfer_buf[1518];
+	u16 next_ptr;
+};
 
 static u8 spi_readReg(struct spi_device *spi, u8 address)
 {
@@ -20,7 +23,7 @@ static u8 spi_readReg(struct spi_device *spi, u8 address)
 	int slen = 1; 
 	int ret;
 	
-	if(address & 0x80) //set 8th bit fora MAC/MIIM register address
+	if(address & 0x80) //set 8th bit for a MAC/MIIM register address
 		slen++;
 
 	tx_buf[0] = (0x00 | (address & 0x1f)); //ADDR_MASK 
@@ -30,7 +33,12 @@ static u8 spi_readReg(struct spi_device *spi, u8 address)
 		printk(KERN_INFO "readReg failed\n");
 	}
 	else {
-		val = rx_buf[0];
+		/*
+		 * MAC/MII registers prepend a dummy byte before the real data,
+		 * so slen == 2: rx_buf[0] is dummy, rx_buf[1] is the value.
+		 * ETH registers return the value directly in rx_buf[0].
+		 */
+		val = (address & 0x80) ? rx_buf[1] : rx_buf[0];
 	}
 
 	return val;
@@ -61,12 +69,13 @@ static void enc28j60_set_bank(struct spi_device *spi, int num)
     spi_writeReg(spi, 0x1f, econ1_val);
 }
 
-static u8 get_revision(void) 
+/* get_revision - read silicon revision ID from EREVID (Bank3, 0x12) */
+static u8 get_revision(struct enc_priv *priv)
 {
 	u8 rev = 0;
 
-	enc28j60_set_bank(my_spi, 3);
-	rev = spi_readReg(my_spi, 0x12);
+	enc28j60_set_bank(priv->my_spi, 3);
+	rev = spi_readReg(priv->my_spi, 0x12);
 
 	return rev; 
 }
@@ -92,15 +101,22 @@ static int spi_read_buf(struct spi_device *spi,
 
 }
 
-static int spi_write_buf(struct spi_device *spi, int len, u8 *tx_buf) 
+/*
+ * spi_write_buf - write a data buffer to ENC28J60 SRAM via WBM command
+ * @priv: driver private data; priv->spi_transfer_buf is used to prepend
+ *        the WBM opcode (0x7A) before the payload
+ * @len:  number of payload bytes to write
+ * @tx_buf: pointer to the data to write
+ *
+ * The caller is responsible for setting EWRPT before calling this function.
+ */
+static int spi_write_buf(struct enc_priv *priv, int len, u8 *tx_buf) 
 {
 	int ret = 0; 
 
-	spi_writeReg(spi, 0x1f, 0x00);
-
-	spi_transfer_buf[0]  = 0x7A;
-	memcpy(&spi_transfer_buf[1], tx_buf, len);
-	ret = spi_write(spi, spi_transfer_buf, len+1);
+	priv->spi_transfer_buf[0]  = 0x7A;
+	memcpy(&priv->spi_transfer_buf[1], tx_buf, len);
+	ret = spi_write(priv->my_spi, priv->spi_transfer_buf, len+1);
 
 	if(ret) {
 		printk(KERN_INFO "spi_write_buf failed\n");
@@ -111,55 +127,6 @@ static int spi_write_buf(struct spi_device *spi, int len, u8 *tx_buf)
 }
 
 
-/*
-  test_enc28j60_sram - Test the ENC28J60 internal SRAM read/write operations.
-  @spi: Pointer to the SPI device structure.
-
-static void test_enc28j60_sram(struct spi_device *spi)
-{
-	u8 test_data_out[10] = {0xDE, 0xAD, 0xBE, 0xEF, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC};
-	u8 test_data_in[10] = {0};
-	u16 test_addr = 0x1000; // Arbitrary address within SRAM (0x0000-0x1FFF) 
-	int i;
-	bool success = true;
-
-	printk(KERN_INFO "ENC28J60: Starting SRAM test at address 0x%04x\n", test_addr);
-
-	// Step 1: Write test pattern to SRAM 
-	spi_write_buf(spi, test_addr, 10, test_data_out);
-
-	// Step 2: Read back the data from SRAM 
-	spi_read_buf(spi, test_addr, 10, test_data_in);
-
-	///Step 3: Compare and verify the data 
-	printk(KERN_INFO "ENC28J60: Data read back: ");
-	for (i = 0; i < 10; i++) {
-		printk(KERN_CONT "%02x ", test_data_in[i]);
-		if (test_data_out[i] != test_data_in[i])
-			success = false;
-	}
-	printk(KERN_CONT "\n");
-
-	if (success)
-		printk(KERN_INFO "ENC28J60: SRAM R/W test passed\n");
-	else
-		printk(KERN_ERR "ENC28J60: SRAM R/W test failed! Data mismatch detected.\n");
-} */ 
-
-static u8 enc28j60_mac_addr(struct spi_device *spi) {
-	u8 mac_addr[6];
-	eth_random_addr(mac_addr);
-	printk(KERN_INFO "my_enc28j60: Generated Random MAC = %pM\n", mac_addr);
-	enc28j60_set_bank(spi, 3);
-	spi_writeReg(spi, 0x00, mac_addr[0]); // MAADR5 
-	spi_writeReg(spi, 0x01, mac_addr[1]); // MAADR4
-	spi_writeReg(spi, 0x02, mac_addr[2]); // MAADR3
-	spi_writeReg(spi, 0x03, mac_addr[3]); // MAADR2
-	spi_writeReg(spi, 0x04, mac_addr[4]); // MAADR1
-	spi_writeReg(spi, 0x05, mac_addr[5]); // MAADR0 
-
-	enc28j60_set_bank(spi, 0);
-}
 
 
 static u16 erxrdpt_workaround(u16 next_packet_ptr)
@@ -184,100 +151,92 @@ static u16 rx_packet_start(u16 addr) {
 		return addr + 6; 
 }
 
-static int enc28j60_hw_init(struct spi_device *spi)
-{
-    u8 bfc[2];
+/*
+ * enc28j60_set_mac_addr - program the randomly generated MAC address into
+ *                         the ENC28J60 MAADR registers (Bank3)
+ * @priv: driver private data
+ *
+ * The ENC28J60 stores the MAC address in reverse byte order:
+ * MAADR0 holds the last octet, MAADR5 holds the first octet.
+ */
+static void enc28j60_set_mac_addr(struct enc_priv *priv) {
+	struct net_device *dev = priv->netdev;
+	struct spi_device *spi = priv->my_spi;
 
-    // 1. 소프트 리셋
-    u8 rst = 0xFF;
-    spi_write(spi, &rst, 1);
-    udelay(2000);
+	printk(KERN_INFO "my_enc28j60: Generated Random MAC = %pM\n", dev->dev_addr);
 
-    // 2. RX 버퍼 설정 (Bank0)
-    enc28j60_set_bank(spi, 0);
-    spi_writeReg(spi, 0x08, 0x00); // ERXSTL
-    spi_writeReg(spi, 0x09, 0x00); // ERXSTH
-    spi_writeReg(spi, 0x0a, 0xFF); // ERXNDL
-    spi_writeReg(spi, 0x0b, 0x19); // ERXNDH  (0x19FF)
-    spi_writeReg(spi, 0x0c, 0xFF); // ERXRDPTL (에라타: 홀수)
-    spi_writeReg(spi, 0x0d, 0x19); // ERXRDPTH
-    spi_writeReg(spi, 0x04, 0x00); // ETXSTL
-    spi_writeReg(spi, 0x05, 0x1A); // ETXSTH 
+	enc28j60_set_bank(spi, 3);
 
-    // 3. MAC 수신 활성화 (Bank2) ← 없으면 PKTIF 절대 안 뜸
-    enc28j60_set_bank(spi, 2);
-    spi_writeReg(spi, 0x00, 0x0D); // MACON1: MARXEN|TXPAUS|RXPAUS
-    spi_writeReg(spi, 0x02, 0xF3); // MACON3: PADCFG|TXCRCEN|FRMLNEN
-    spi_writeReg(spi, 0x0a, 0xEE); // MAMXFLL (1518)
-    spi_writeReg(spi, 0x0b, 0x05); // MAMXFLH
-
-    // 4. 수신 필터 끄기 - 모든 패킷 수신 (Bank1)
-    enc28j60_set_bank(spi, 1);
-    spi_writeReg(spi, 0x18, 0x00); // ERXFCON: promiscuous
-
-    // 5. EIR 클리어 후 EIE 설정
-    enc28j60_set_bank(spi, 0);
-    bfc[0] = 0xA0 | 0x1C; bfc[1] = 0x7F; // BFC EIR
-    spi_write(spi, bfc, 2);
-    spi_writeReg(spi, 0x1b, 0xC0); // EIE: INTIE|PKTIE
-
-    // 6. RXEN 마지막
-    u8 econ1 = spi_readReg(spi, 0x1f);
-    spi_writeReg(spi, 0x1f, econ1 | 0x04);
-
-    enc28j60_mac_addr(spi);
-    return 0;
-}
-
-
-/*static int enc28j60_hw_init(struct spi_device *spi) 
-{
-	u8 econ1_val; 
-
-	u8 reset_cmd = 0xFF;
-	spi_write(spi, &reset_cmd, 1);
-	msleep(5);
-
-	//enable interrupt 
-	spi_writeReg(spi, 0x1b, 0xC0); 
-//	spi_writeReg(spi, 0x1b, 0xFB);
-
-	u8 read_eie = spi_readReg(spi, 0x1B);
-	printk(KERN_INFO "my_enc28j60: Verification -> Wrote 0xC0, Read back: 0x%02x\n", read_eie);
+	/* ENC28J60 MAC address registers are stored in reverse byte order */
+	spi_writeReg(spi, 0x00, dev->dev_addr[5]); // MAADR0
+	spi_writeReg(spi, 0x01, dev->dev_addr[4]); // MAADR1
+	spi_writeReg(spi, 0x02, dev->dev_addr[3]); // MAADR2
+	spi_writeReg(spi, 0x03, dev->dev_addr[2]); // MAADR3
+	spi_writeReg(spi, 0x04, dev->dev_addr[1]); // MAADR4
+	spi_writeReg(spi, 0x05, dev->dev_addr[0]); // MAADR5
 
 	enc28j60_set_bank(spi, 0);
-	u8 read_econ1 = spi_readReg(spi, 0x1f);
-	printk(KERN_INFO "my_enc28j60: Verification -> Wrote econ1-val, Read back: 0x%02x\n", read_econ1);
+}
 
-	spi_writeReg(spi, 0x08, 0x00);	//ERXSTL
-        spi_writeReg(spi, 0x09, 0x00);	//ERXSTH
+static int enc28j60_hw_init(struct enc_priv *priv)
+{
+	struct spi_device *spi = priv->my_spi;
+	u8 bfc[2];
 
-	spi_writeReg(spi, 0x0a, 0xFF);	//ERXNDL
-        spi_writeReg(spi, 0x0b, 0x19);	//ERXNDH
+	// 1. 소프트 리셋
+	u8 rst = 0xFF;
+	spi_write(spi, &rst, 1);
+	udelay(2000);
 
-	spi_writeReg(spi, 0x0c, 0xFF);	//ERXRDPTL
-        spi_writeReg(spi, 0x0d, 0x19);	//ERXRDPTH
-	
+	// 2. RX 버퍼 설정 (Bank0)
+	enc28j60_set_bank(spi, 0);
+	spi_writeReg(spi, 0x08, 0x00); // ERXSTL
+	spi_writeReg(spi, 0x09, 0x00); // ERXSTH
+	spi_writeReg(spi, 0x0a, 0xFF); // ERXNDL
+	spi_writeReg(spi, 0x0b, 0x19); // ERXNDH  (0x19FF)
+	spi_writeReg(spi, 0x0c, 0xFF); // ERXRDPTL (에라타: 홀수)
+	spi_writeReg(spi, 0x0d, 0x19); // ERXRDPTH
+	spi_writeReg(spi, 0x04, 0x00); // ETXSTL
+	spi_writeReg(spi, 0x05, 0x1A); // ETXSTH 
+
+	// 3. MAC 수신 활성화 (Bank2) ← 없으면 PKTIF 절대 안 뜸
+	enc28j60_set_bank(spi, 2);
+	spi_writeReg(spi, 0x00, 0x0D); // MACON1: MARXEN|TXPAUS|RXPAUS
+	spi_writeReg(spi, 0x02, 0xF3); // MACON3: PADCFG|TXCRCEN|FRMLNEN
+	spi_writeReg(spi, 0x0a, 0xEE); // MAMXFLL (1518)
+	spi_writeReg(spi, 0x0b, 0x05); // MAMXFLH
+
+	// 4. 수신 필터 끄기 - 모든 패킷 수신 (Bank1)
 	enc28j60_set_bank(spi, 1);
-	spi_writeReg(spi, 0x18, 0x00);	//ERXFCON 
-//	spi_writeReg(spi, 0x18, 0xA1); 
-	
+	spi_writeReg(spi, 0x18, 0x00); // ERXFCON: promiscuous
 
-	econ1_val = spi_readReg(spi, 0x1f); 
-	econ1_val |= 0x04; 
-	spi_writeReg(spi, 0x1f, econ1_val); //ECON1.RXEN 
+	// 5. EIR 클리어 후 EIE 설정
+	enc28j60_set_bank(spi, 0);
+	bfc[0] = 0xA0 | 0x1C; bfc[1] = 0x7F; // BFC EIR
+	spi_write(spi, bfc, 2);
+	spi_writeReg(spi, 0x1b, 0xC0); // EIE: INTIE|PKTIE
 
+	// 6. RXEN 마지막
+	u8 econ1 = spi_readReg(spi, 0x1f);
+	spi_writeReg(spi, 0x1f, econ1 | 0x04);
+
+	enc28j60_set_mac_addr(priv);
 	return 0;
-}*/
+}
 
-/*static int enc28j60_rx(struct spi_device *spi) 
+/*
+ * enc28j60_tx - transmit a single Ethernet frame
+ * @priv: driver private data
+ * @len:  frame length in bytes (excluding per-packet control byte)
+ * @tx_buf: pointer to frame data
+ *
+ * TX buffer is fixed at 0x1A00 - 0x1FFF.
+ * A per-packet control byte (0x00 = use MACON3 defaults) is written
+ * before the frame.  ECON1.TXRTS is set to start transmission.
+ */
+static int enc28j60_tx(struct enc_priv *priv, int len, u8 *tx_buf) 
 {
-	printk(KERN_INFO "my_enc28j60: enc278j60_rw\n");
-	return 0;
-}*/
-
-static int enc28j60_tx(struct spi_device *spi, int len, u8 *tx_buf) 
-{
+	struct spi_device *spi = priv->my_spi;
 	u8 bfs[2];
 	u16 etxnd; 
 	u8 control[2];
@@ -293,18 +252,20 @@ static int enc28j60_tx(struct spi_device *spi, int len, u8 *tx_buf)
 	spi_writeReg(spi, 0x07, etxnd >> 8);	//ETXNDH 
 	
 	spi_write(spi, control, 2); //write per-packet control byte 
-	spi_write_buf(spi, len, tx_buf);	//SRAM data write 
+	spi_write_buf(priv, len, tx_buf);	//SRAM data write 
 						//
 	//set ECON1.TXRTS, transmit request to send bit from ETXST to ETXND 
 	bfs[0] = 0x80 | 0x1F;		
 	bfs[1] = 0x08;
 	spi_write(spi, bfs, 2);
-	
+
+	return 0;
 }
 
 
-static int enc28j60_rx(struct spi_device *spi) 
+static int enc28j60_rx(struct enc_priv *priv) 
 {
+	struct spi_device *spi = priv->my_spi;
 	u16 next_pk_ptr;
 	int i, ret, len; 
 	ret = 0;
@@ -312,7 +273,7 @@ static int enc28j60_rx(struct spi_device *spi)
 	u16 erxrdpt;
 	u8 bfs[2];
 
-	if(spi_read_buf(spi, next_ptr, 4, rsv)) {
+	if(spi_read_buf(spi, priv->next_ptr, 4, rsv)) {
 		printk(KERN_DEBUG "enc28j60_rx failed to read buf_1\n");
 		return -1; 
 	}
@@ -325,7 +286,7 @@ static int enc28j60_rx(struct spi_device *spi)
 	len <<= 8;
 	len |= rsv[2];	
 
-	if(spi_read_buf(spi, rx_packet_start(next_ptr), len, rx_test_buf)) {		
+	if(spi_read_buf(spi, rx_packet_start(priv->next_ptr), len, priv->rx_test_buf)) {		
 		printk(KERN_DEBUG "enc28j60_rx failed to read buf_2\n");
 		return -1;  
 	}
@@ -341,16 +302,18 @@ static int enc28j60_rx(struct spi_device *spi)
 	bfs[1] = 0x40;
 	spi_write(spi, bfs, 2);
 
-	next_ptr = next_pk_ptr;
+	priv->next_ptr = next_pk_ptr;
 
 	printk(KERN_INFO "ENC28J60: RX Interrupt Checking: ");
-	print_hex_dump(KERN_INFO, "ENC28J60: RX Packet: ", DUMP_PREFIX_OFFSET, 16, 1, rx_test_buf, len, true);
+	print_hex_dump(KERN_INFO, "ENC28J60: RX Packet: ", DUMP_PREFIX_OFFSET, 16, 1, priv->rx_test_buf, len, true);
 	return ret; 
 }
 
-static int enc28j60_rx_interrupt(struct spi_device *spi)
+static int enc28j60_rx_interrupt(struct enc_priv *priv)
 {
+	struct spi_device *spi = priv->my_spi;
 	int pkt_cnt;
+
 	enc28j60_set_bank(spi, 1);
 	pkt_cnt = (int)spi_readReg(spi, 0x19);
 	printk(KERN_INFO "pkt_cnt = %d\n", pkt_cnt); 
@@ -361,7 +324,7 @@ static int enc28j60_rx_interrupt(struct spi_device *spi)
 	while(pkt_cnt-- > 0) {
 	//	spi_writeReg(spi, 0x1E, 0x40);  //write 1 to ECON2.PKTDEC to decrement
 	//	printk(KERN_INFO "pkt_cnt after Decrement attempt = %d\n", pkt_cnt); 
-		enc28j60_rx(spi);
+		enc28j60_rx(priv);
 	}
 	return pkt_cnt;
 }
@@ -370,7 +333,9 @@ static irqreturn_t enc28j60_irq_thread(int irq, void *dev_id)
 {
 	int loop;
 	u8 pkt_cnt;
-	struct spi_device *spi = (struct spi_device *)dev_id;
+	/* dev_id is priv, registered in probe via request_threaded_irq() */
+	struct enc_priv *priv = (struct enc_priv *)dev_id;
+	struct spi_device *spi = priv->my_spi;
 	u8 intflag = spi_readReg(spi, 0x1c);
 	u8 bfc[2];
 
@@ -378,7 +343,7 @@ static irqreturn_t enc28j60_irq_thread(int irq, void *dev_id)
 	
 	printk(KERN_INFO "my_enc28j60: [★★★ IRQ THREAD WOKE UP! ★★★]\n");
 
-	enc28j60_rx_interrupt(spi);
+	enc28j60_rx_interrupt(priv);
 
 /*	do {
 		loop = 0;
@@ -415,42 +380,91 @@ static irqreturn_t enc28j60_irq_thread(int irq, void *dev_id)
 	} while(loop);	*/
 
 	//clear EIR flags 
-    bfc[0] = 0xA0 | 0x1C;
-    bfc[1] = intflag & 0x7F;
-    spi_write(spi, bfc, 2);
+	bfc[0] = 0xA0 | 0x1C;
+	bfc[1] = intflag & 0x7F;
+	spi_write(spi, bfc, 2);
 	
 	return IRQ_HANDLED;
 }
+
+/*
+ * enc28j60_start_xmit - ndo_start_xmit handler for net_device_ops
+ * @skb: socket buffer handed down from the network stack
+ * @dev: net_device associated with this driver instance
+ *
+ * Passes the raw frame to enc28j60_tx() and frees the skb.
+ * TX statistics are updated on each call.
+ */
+static netdev_tx_t enc28j60_start_xmit(struct sk_buff *skb,
+					struct net_device *dev)
+{
+	struct enc_priv *priv = netdev_priv(dev);
+
+	enc28j60_tx(priv, skb->len, skb->data);
+
+	dev->stats.tx_packets++;
+	dev->stats.tx_bytes += skb->len;
+
+	dev_kfree_skb(skb);
+	return NETDEV_TX_OK;
+}
+
+static const struct net_device_ops enc28j60_netdev_ops = {
+	.ndo_start_xmit = enc28j60_start_xmit,
+};
 
 /**
  * my_enc28j60_probe - Bind the driver to an SPI device
  */
 static int my_enc28j60_probe(struct spi_device *spi)
 {
-	my_spi = spi; 
 	u8 rev; 
 	int ret; 
+
+	struct net_device *dev; 
+	struct enc_priv *priv; 
+
+	dev = alloc_etherdev(sizeof(struct enc_priv));
+	if (!dev) {
+		ret = -ENOMEM;
+	}
+
+	priv = netdev_priv(dev);
+
+	priv->netdev = dev;	/* priv to netdev reference */
+	priv->my_spi = spi;	/* priv to spi reference */
+
+	/* store priv in spi drvdata so my_enc28j60_remove() can retrieve it */
+	spi_set_drvdata(spi, priv);
+
+	dev->irq = spi->irq;
+	dev->netdev_ops = &enc28j60_netdev_ops;
+
+	eth_hw_addr_random(dev);
+
 
 	printk(KERN_INFO "======================================\n");
 	printk(KERN_INFO "My Driver: Probe function called!\n");
 	printk(KERN_INFO "My Driver: Matching with compatible 'my,enc28j60' SUCCESS!\n");
 	printk(KERN_INFO "======================================\n");
 
-//	test_enc28j60_sram(my_spi);
-	rev = get_revision();	
+	rev = get_revision(priv);	
 	printk(KERN_INFO "Revision Number: %x\n", rev);
 	
 
 	printk(KERN_INFO "probe called, spi->irq = %d\n", spi->irq);
 
-	enc28j60_hw_init(spi); 
-	u8 eir_val = spi_readReg(spi, 0x1C); // EIR 레지스터 주소 0x1C
-	printk(KERN_INFO "my_enc28j60: Check EIR Register = 0x%02x\n", eir_val);
-	ret = request_threaded_irq(spi->irq, NULL, enc28j60_irq_thread, 
-		IRQF_ONESHOT, "my_enc28j60", spi);
+	/* hw_init also calls enc28j60_set_mac_addr() as its last step */
+	enc28j60_hw_init(priv); 
 
-	next_ptr = 0x0000;	//start pointer 
-				//
+	/* pass priv as dev_id so enc28j60_irq_thread() can reach all state */
+	ret = request_threaded_irq(spi->irq, NULL, enc28j60_irq_thread, 
+		IRQF_ONESHOT, "my_enc28j60", priv);
+
+	priv->next_ptr = 0x0000;	//start pointer 
+					//
+					//
+	ret = register_netdev(dev);
 
 	return ret; 
 }
@@ -460,7 +474,10 @@ static int my_enc28j60_probe(struct spi_device *spi)
  */
 static int my_enc28j60_remove(struct spi_device *spi)
 {
-	free_irq(spi->irq, spi);
+	struct enc_priv *priv = spi_get_drvdata(spi);
+	unregister_netdev(priv->netdev);
+	free_irq(spi->irq, priv);	/* dev_id must match what probe passed */
+	free_netdev(priv->netdev);
 	printk(KERN_INFO "My Driver: Remove function called. Goodbye!\n");
 	return 0;
 }
@@ -498,7 +515,5 @@ module_init(my_enc28j60_init);
 module_exit(my_enc28j60_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Your Name");
+MODULE_AUTHOR("SonHeeSeung");
 MODULE_DESCRIPTION("SPI probe skeleton driver");
-
-
