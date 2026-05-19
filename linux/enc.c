@@ -16,7 +16,7 @@ struct enc_priv {
 
 	struct work_struct tx_work;
 	struct sk_buff *tx_skb; 
-//	struct mutex spi_lock;
+	struct mutex spi_lock;
 };
 
 static u8 spi_readReg(struct spi_device *spi, u8 address)
@@ -109,14 +109,9 @@ static int spi_read_buf(struct spi_device *spi,
 
 static u16 erxrdpt_workaround(u16 next_packet_ptr)
 {
-	u16 erxrdpt;
-
-	if ((next_packet_ptr - 1 < 0x0000) || (next_packet_ptr - 1 > 0x19ff))
-		erxrdpt = 0x19FF;
-	else
-		erxrdpt = next_packet_ptr - 1;
-
-	return erxrdpt;
+	if (next_packet_ptr == 0x0000)
+		return 0x19FF;
+	return next_packet_ptr - 1;
 }
 
 static u16 rx_packet_start(u16 addr) {
@@ -202,8 +197,6 @@ static int enc28j60_hw_init(struct enc_priv *priv)
 	return 0;
 }
 
-
-
 static int enc28j60_rx(struct enc_priv *priv) 
 {
 	struct spi_device *spi = priv->my_spi;
@@ -229,6 +222,11 @@ static int enc28j60_rx(struct enc_priv *priv)
 	len <<= 8;
 	len |= rsv[2];	
 
+	if (len > 1518 || len < 60) {
+		return -1;
+	}
+
+
 	skb = netdev_alloc_skb(dev, len + NET_IP_ALIGN); 
 	if(!skb) {
 
@@ -246,9 +244,9 @@ static int enc28j60_rx(struct enc_priv *priv)
 	skb->protocol = eth_type_trans(skb, dev); 
 	netif_rx_ni(skb);
 
-	enc28j60_set_bank(spi, 0);
 
 	erxrdpt = erxrdpt_workaround(next_pk_ptr);
+	enc28j60_set_bank(spi, 0);
 	spi_writeReg(spi, 0x0c, (u8)(erxrdpt & 0xFF));	//ERXRDPTL
 	spi_writeReg(spi, 0x0d, (u8)(erxrdpt >> 8));	//ERXRDPTH 
 							//
@@ -262,7 +260,7 @@ static int enc28j60_rx(struct enc_priv *priv)
 	return ret; 
 }
 
-static int enc28j60_rx_interrupt(struct enc_priv *priv)
+static void enc28j60_rx_interrupt(struct enc_priv *priv)
 {
 	struct spi_device *spi = priv->my_spi;
 	int pkt_cnt;
@@ -274,23 +272,26 @@ static int enc28j60_rx_interrupt(struct enc_priv *priv)
 	enc28j60_set_bank(spi, 0);
 
 
-	while(pkt_cnt-- > 0) {
-	//	spi_writeReg(spi, 0x1E, 0x40);  //write 1 to ECON2.PKTDEC to decrement
-	//	printk(KERN_INFO "pkt_cnt after Decrement attempt = %d\n", pkt_cnt); 
+	while(pkt_cnt > 0) {
 		enc28j60_rx(priv);
+
+		enc28j60_set_bank(spi, 1);
+		pkt_cnt = (int)spi_readReg(spi, 0x19);
 	}
-	return pkt_cnt;
+
 }
 
 static irqreturn_t enc28j60_irq_thread(int irq, void *dev_id) 
 {
 	int loop;
 	u8 pkt_cnt;
+	u8 bfc[2];
 	/* dev_id is priv, registered in probe via request_threaded_irq() */
 	struct enc_priv *priv = (struct enc_priv *)dev_id;
 	struct spi_device *spi = priv->my_spi;
+
+	mutex_lock(&priv->spi_lock);
 	u8 intflag = spi_readReg(spi, 0x1c);
-	u8 bfc[2];
 
 	printk(KERN_INFO "my_enc28j60: Int Flag: 0x%02x\n", intflag);
 	
@@ -298,45 +299,12 @@ static irqreturn_t enc28j60_irq_thread(int irq, void *dev_id)
 
 	enc28j60_rx_interrupt(priv);
 
-/*	do {
-		loop = 0;
-		if((intflag & 0x01)  != 0) {
-			loop++;
-			printk(KERN_DEBUG "my_enc28j60_custom: RX error Int\n");
-		}
-		if((intflag & 0x02)  != 0) {
-			loop++;
-			printk(KERN_DEBUG "my_enc28j60_custom: TX error Int\n");
-		}
-		if((intflag & 0x08)  != 0) {
-			loop++;
-			printk(KERN_DEBUG "my_enc28j60_custom: TX Int\n");
-		}
-		if((intflag & 0x10)  != 0) {
-			loop++;
-			printk(KERN_DEBUG "my_enc28j60_custom: Link Int\n");
-		}
-		if((intflag & 0x20)!= 0) {
-			loop++;
-			printk(KERN_DEBUG "my_enc28j60_custom: DMA error Int\n");
-		}
-		if((intflag & 0x40)!= 0) {
-			loop++;
-			printk(KERN_DEBUG "my_enc28j60_custom: PKT Int\n");
-		}
-
-		if(enc28j60_rx_interrupt(spi)) {
-			loop++;
-		}
-					
-
-	} while(loop);	*/
-
 	//clear EIR flags 
 	bfc[0] = 0xA0 | 0x1C;
 	bfc[1] = intflag & 0x7F;
 	spi_write(spi, bfc, 2);
-	
+
+	mutex_unlock(&priv->spi_lock);
 	return IRQ_HANDLED;
 }
 
@@ -446,21 +414,23 @@ static int enc28j60_stop(struct net_device *dev)
 {
 	struct enc_priv *priv = netdev_priv(dev);
 	struct spi_device *spi = priv->my_spi;
-	u8 econ1;
+	u8 bfc[2];
 
 	printk(KERN_INFO "my_enc28j60: ndo_stop called! Shutting down HW...\n");
+
+	mutex_lock(&priv->spi_lock);
 	netif_stop_queue(dev);
-	cancel_work_sync(&priv->tx_work);
 
 	// 마스터 인터럽트 스위치 OFF
 	enc28j60_set_bank(spi, 0);
 	spi_writeReg(spi, 0x1b, 0x00);
 
 	// RXEN 오프하여 수신 엔진 일시정지
-	econ1 = spi_readReg(spi, 0x1f);
-	spi_writeReg(spi, 0x1f, econ1 & ~0x04);
+	bfc[0] = 0xA0 | 0x1f;
+	bfc[1] = 0x04;
+	spi_write(spi, bfc, 2);
 
-	msleep(50);
+	mutex_unlock(&priv->spi_lock);
 	return 0;
 }
 static const struct net_device_ops enc28j60_netdev_ops = {
@@ -486,6 +456,7 @@ static int my_enc28j60_probe(struct spi_device *spi)
 	}
 
 	priv = netdev_priv(dev);
+	mutex_init(&priv->spi_lock);
 
 	priv->netdev = dev;	/* priv to netdev reference */
 	priv->my_spi = spi;	/* priv to spi reference */
@@ -511,13 +482,13 @@ static int my_enc28j60_probe(struct spi_device *spi)
 	printk(KERN_INFO "probe called, spi->irq = %d\n", spi->irq);
 
 
+	priv->next_ptr = 0x0000;	//start pointer 
 	INIT_WORK(&priv->tx_work, enc28j60_tx_work);
 
 	/* pass priv as dev_id so enc28j60_irq_thread() can reach all state */
 	ret = request_threaded_irq(spi->irq, NULL, enc28j60_irq_thread, 
 		IRQF_ONESHOT, "my_enc28j60", priv);
 
-	priv->next_ptr = 0x0000;	//start pointer 
 					//
 					//
 	ret = register_netdev(dev);
@@ -534,7 +505,7 @@ static int my_enc28j60_remove(struct spi_device *spi)
 	unregister_netdev(priv->netdev);
 	free_irq(spi->irq, priv);	/* dev_id must match what probe passed */
 	free_netdev(priv->netdev);
-	cancel_work_sync(&priv->tx_work);
+//	cancel_work_sync(&priv->tx_work);
 	printk(KERN_INFO "My Driver: Remove function called. Goodbye!\n");
 	return 0;
 }
